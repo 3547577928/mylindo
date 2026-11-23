@@ -1,0 +1,52 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "LinuxDo",
+  "version": "0.1.0",
+  "identifier": "com.example.linuxdo",
+  "build": {
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "LinuxDo",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "visible": true,
+        "decorations": true,
+        "transparent": false,
+        "focus": true,
+        "acceptFirstMouse": true,
+        "devtools": false,
+        "create": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "targets": [
+      "app",
+      "dmg"
+    ],
+    "category": "public.app-category.social-networking",
+    "shortDescription": "LinuxDo desktop client",
+    "longDescription": "A lightweight macOS desktop wrapper for LinuxDo and Juejin.",
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  }
+}
