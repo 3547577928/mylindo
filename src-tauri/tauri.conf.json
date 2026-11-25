@@ -38,10 +38,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "targets": [
-      "app",
-      "dmg"
-    ],
+    "targets": "all",
     "category": "public.app-category.social-networking",
     "shortDescription": "LinuxDo desktop client",
     "longDescription": "A lightweight macOS desktop wrapper for LinuxDo and Juejin.",
