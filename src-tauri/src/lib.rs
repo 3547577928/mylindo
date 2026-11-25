@@ -79,7 +79,9 @@ const TOOLBAR_SCRIPT: &str = r#"
 
     const host = document.createElement('div');
     host.id = '__linuxdo_desktop_toolbar';
-    host.style.cssText = 'position:fixed;top:16px;left:0;right:0;height:46px;z-index:2147483647;pointer-events:none;';
+    // Anchored to the bottom so the sites' own top navigation bars stay
+    // visible and clickable; both child pills position within this host.
+    host.style.cssText = 'position:fixed;bottom:16px;left:0;right:0;height:46px;z-index:2147483647;pointer-events:none;';
     host.tabIndex = -1;
     const shadow = host.attachShadow({ mode: 'closed' });
     shadow.innerHTML = `
@@ -90,7 +92,7 @@ const TOOLBAR_SCRIPT: &str = r#"
           position: absolute;
           left: 50%;
           transform: translateX(-50%);
-          width: min(480px, calc(100vw - 620px));
+          width: min(480px, calc(100vw - 640px));
           height: 46px;
           display: flex;
           align-items: center;
@@ -314,6 +316,7 @@ fn build_site_window(
             if target_site.label() == navigation_label {
                 return true;
             }
+            let deep_url = deep_navigation_url(target);
             let app = navigation_app.clone();
             // run_on_main_thread executes inline when already on the UI thread.
             // Queue from a worker so the navigation callback returns before
@@ -321,7 +324,7 @@ fn build_site_window(
             tauri::async_runtime::spawn(async move {
                 let ui_app = app.clone();
                 if let Err(error) = app.run_on_main_thread(move || {
-                    if let Err(error) = reveal_site_window(&ui_app, target_site) {
+                    if let Err(error) = reveal_site_window(&ui_app, target_site, deep_url) {
                         eprintln!("Could not switch site: {error}");
                         for label in [LINUXDO_LABEL, JUEJIN_LABEL] {
                             if let Some(window) = ui_app.get_webview_window(label) {
@@ -338,12 +341,21 @@ fn build_site_window(
             });
             false
         })
-        .on_new_window(|url, _features| {
-            // window.open / target=_blank should not open new app windows.
-            // Hand the URL to the system browser instead, so links in posts
-            // keep working without spawning weak duplicate shells.
-            open_in_browser(&url);
-            tauri::webview::NewWindowResponse::Deny
+        .on_new_window({
+            let new_window_app = app.clone();
+            move |url, _features| {
+                // target=_blank / window.open never spawns an app window:
+                // juejin opens every post with target=_blank, so supported
+                // site URLs are routed back into the shell and the rest go
+                // to the system browser. Queue the work so this delegate
+                // callback returns before we touch any webview.
+                let app = new_window_app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let ui_app = app.clone();
+                    let _ = app.run_on_main_thread(move || route_new_window(&ui_app, url));
+                });
+                tauri::webview::NewWindowResponse::Deny
+            }
         })
         .build()
 }
@@ -351,11 +363,16 @@ fn build_site_window(
 /// Show `target`'s window and hide the other site's window. The incoming
 /// window inherits the outgoing one's on-screen geometry so the switch does
 /// not move anything; both webviews stay loaded, each keeping its scroll
-/// position, history and login state.
-fn reveal_site_window(app: &AppHandle, target: Site) -> tauri::Result<()> {
+/// position, history and login state. A deep `url` (a specific post or
+/// topic) loads in the incoming window; a site-root switch keeps whatever
+/// page that window already shows.
+fn reveal_site_window(app: &AppHandle, target: Site, url: Option<Url>) -> tauri::Result<()> {
     let incoming = app
         .get_webview_window(target.label())
         .ok_or_else(|| tauri::Error::WindowNotFound)?;
+    if let Some(url) = url {
+        incoming.navigate(url)?;
+    }
     let outgoing = app.get_webview_window(target.other().label());
     if let Some(outgoing) = &outgoing {
         if outgoing.is_visible().unwrap_or(false) {
@@ -383,6 +400,44 @@ fn reveal_site_window(app: &AppHandle, target: Site) -> tauri::Result<()> {
         state.lock().unwrap().active = target;
     }
     Ok(())
+}
+
+/// Deep URLs (a specific post or topic) load at the target; site-root
+/// navigations keep the target window's current page, so switching sites
+/// via the dropdown never resets the other site's reading position.
+fn deep_navigation_url(url: &Url) -> Option<Url> {
+    let is_root = matches!(url.path(), "/" | "");
+    (!is_root).then(|| url.clone())
+}
+
+/// Decide where a `window.open` / `target=_blank` request goes. Links to
+/// the two supported sites stay in the app — same-site links navigate the
+/// active window, cross-site links load in the other site's window — and
+/// everything else opens in the system browser.
+fn route_new_window(app: &AppHandle, url: Url) {
+    let Some(target_site) = site_for_url(&url) else {
+        // Ignore non-web schemes (about:blank, custom schemes) instead of
+        // puzzling the user with an empty browser tab.
+        if matches!(url.scheme(), "http" | "https") {
+            open_in_browser(&url);
+        }
+        return;
+    };
+    let active = app
+        .try_state::<SharedState>()
+        .map(|state| state.lock().unwrap().active)
+        .unwrap_or(Site::LinuxDo);
+    if target_site == active {
+        if let Some(window) = app.get_webview_window(active.label()) {
+            if let Err(error) = window.navigate(url) {
+                eprintln!("Could not follow new-window link in-app: {error}");
+            }
+        }
+        return;
+    }
+    if let Err(error) = reveal_site_window(app, target_site, deep_navigation_url(&url)) {
+        eprintln!("Could not switch site for new-window link: {error}");
+    }
 }
 
 /// Open `url` with the user's default browser. Uses each platform's native
@@ -659,6 +714,29 @@ mod tests {
         assert_eq!(Site::Juejin.label(), "juejin");
         assert_eq!(Site::LinuxDo.other(), Site::Juejin);
         assert_eq!(Site::Juejin.other(), Site::LinuxDo);
+    }
+
+    #[test]
+    fn site_roots_reveal_only_but_deep_links_navigate() {
+        for url in [
+            "https://juejin.cn/",
+            "https://linux.do/",
+            "https://linux.do/?page=2",
+        ] {
+            assert!(
+                deep_navigation_url(&url.parse().unwrap()).is_none(),
+                "site root should reveal without navigating: {url}"
+            );
+        }
+        for url in [
+            "https://juejin.cn/post/7360000000000000000",
+            "https://linux.do/t/topic/123/5",
+        ] {
+            assert!(
+                deep_navigation_url(&url.parse().unwrap()).is_some(),
+                "deep link should navigate the target window: {url}"
+            );
+        }
     }
 }
 

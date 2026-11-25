@@ -2,12 +2,14 @@
 
 A minimal Tauri 2 + Rust desktop wrapper that opens `https://linux.do/` in a
 native macOS WebView, with 稀土掘金 (`https://juejin.cn/`) one click away.
-The app adds a small floating toolbar with **返回**, **前进**, **刷新**, and a
-**选择站点** dropdown for switching between the two sites. The dropdown shows
-the current site. The current URL appears at the top center in a read-only
-address field; focus it (or press `Cmd+L`) to select and copy the full URL.
-It updates on page navigation and SPA history changes without a polling
-timer. Navigation controls remain on the right.
+The app adds a small floating toolbar anchored to the **bottom edge** with
+**返回**, **前进**, **刷新**, and a **选择站点** dropdown for switching between
+the two sites, so the sites' own top navigation bars stay visible and
+clickable. The dropdown shows the current site. The current URL appears at
+the bottom center in a read-only address field; focus it (or press `Cmd+L`)
+to select and copy the full URL. It updates on page navigation and SPA
+history changes without a polling timer. Navigation controls sit at the
+bottom right.
 
 Both sites keep their own WebView for the whole session. Switching sites
 reveals the other window and hides the current one (geometry is carried
@@ -16,10 +18,13 @@ login state; cookies are shared through the persistent data store either
 way. The last active site and toolbar visibility are remembered across
 launches (`~/Library/Application Support/<identifier>/settings.json`).
 
-Links that would open a new window (`target=_blank`, `window.open`) and the
-menu item **在浏览器中打开当前页面** (`Cmd+Shift+E`) hand the URL to the
-system browser instead of opening a new app window. Top-level navigations to
-other sites (articles, OAuth login redirects) still load in the app.
+Links that would open a new window (`target=_blank`, `window.open`) never
+spawn an app window: URLs on the two supported sites stay in the app (a
+juejin.cn post opens in the app window; a same-tab link to the other site
+switches windows and loads there), while any other site goes to the system
+browser. Top-level navigations to other sites (articles, OAuth login
+redirects) still load in the app, and **在浏览器中打开当前页面**
+(`Cmd+Shift+E`) always hands the current page to the system browser.
 
 Standard macOS menu shortcuts are wired up: `Cmd+R` 刷新, `Cmd+[` / `Cmd+]`
 返回/前进, `Cmd+L` 聚焦地址栏, `Cmd+Shift+B` 切换浮动工具栏,
