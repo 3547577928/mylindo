@@ -1,26 +1,28 @@
 # LinuxDo Desktop (macOS)
 
-A minimal Tauri 2 + Rust desktop wrapper that opens `https://linux.do/` in a
-native macOS WebView, with 稀土掘金 (`https://juejin.cn/`) one click away.
-The app adds a small floating toolbar anchored to the **bottom edge** with
-**返回**, **前进**, **刷新**, and a **选择站点** dropdown for switching between
-the two sites, so the sites' own top navigation bars stay visible and
-clickable. The dropdown shows the current site. The current URL appears at
-the bottom center in a read-only address field; focus it (or press `Cmd+L`)
-to select and copy the full URL. It updates on page navigation and SPA
-history changes without a polling timer. Navigation controls sit at the
-bottom right.
+A minimal Tauri 2 + Rust desktop wrapper for five community sites in native
+WebViews: [LinuxDo](https://linux.do/), 稀土掘金 (juejin.cn), V2EX,
+NodeSeek and SegmentFault 思否. The floating toolbar is anchored to the
+**bottom edge** with **返回**, **前进**, **刷新**, and a **选择站点** dropdown
+for switching between sites, so the sites' own top navigation bars stay
+visible and clickable. The dropdown shows the current site. The current URL
+appears at the bottom center in a read-only address field; focus it (or
+press `Cmd+L`) to select and copy the full URL. It updates on page
+navigation and SPA history changes without a polling timer. Navigation
+controls sit at the bottom right. Menu items **站点** also switch sites with
+`Cmd+1`..`Cmd+5`.
 
-Both sites keep their own WebView for the whole session. Switching sites
-reveals the other window and hides the current one (geometry is carried
-over), so each site keeps its scroll position, back/forward history and
-login state; cookies are shared through the persistent data store either
-way. The last active site and toolbar visibility are remembered across
-launches (`~/Library/Application Support/<identifier>/settings.json`).
+Each site gets its own WebView, created on first visit and kept for the
+whole session. Switching sites reveals the other window and hides the
+current one (geometry is carried over), so each site keeps its scroll
+position, back/forward history and login state; cookies are shared through
+the persistent data store either way. The last active site and toolbar
+visibility are remembered across launches
+(`~/Library/Application Support/<identifier>/settings.json`).
 
 Links that would open a new window (`target=_blank`, `window.open`) never
-spawn an app window: URLs on the two supported sites stay in the app (a
-juejin.cn post opens in the app window; a same-tab link to the other site
+spawn an app window: URLs on the five supported sites stay in the app (a
+juejin.cn post opens in the app window; a link to another supported site
 switches windows and loads there), while any other site goes to the system
 browser. Top-level navigations to other sites (articles, OAuth login
 redirects) still load in the app, and **在浏览器中打开当前页面**

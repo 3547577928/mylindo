@@ -7,25 +7,42 @@ use tauri::{
     WindowEvent,
 };
 
-// Two supported sites. Both windows exist for the whole session and switching
-// is a visibility flip, so each site keeps its position, history and login.
+// Supported sites. Only the active site's window exists at launch; the rest
+// are created on first switch and then kept for the whole session, so every
+// site keeps its position, history and login state.
 const LINUXDO_URL: &str = "https://linux.do/";
 const JUEJIN_URL: &str = "https://juejin.cn/";
-
-const LINUXDO_LABEL: &str = "main";
-const JUEJIN_LABEL: &str = "juejin";
+const V2EX_URL: &str = "https://v2ex.com/";
+const NODESEEK_URL: &str = "https://www.nodeseek.com/";
+const SEGMENTFAULT_URL: &str = "https://segmentfault.com/";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Site {
     LinuxDo,
     Juejin,
+    V2ex,
+    NodeSeek,
+    SegmentFault,
 }
 
 impl Site {
+    fn all() -> [Site; 5] {
+        [
+            Site::LinuxDo,
+            Site::Juejin,
+            Site::V2ex,
+            Site::NodeSeek,
+            Site::SegmentFault,
+        ]
+    }
+
     fn label(self) -> &'static str {
         match self {
-            Site::LinuxDo => LINUXDO_LABEL,
-            Site::Juejin => JUEJIN_LABEL,
+            Site::LinuxDo => "main",
+            Site::Juejin => "juejin",
+            Site::V2ex => "v2ex",
+            Site::NodeSeek => "nodeseek",
+            Site::SegmentFault => "segmentfault",
         }
     }
 
@@ -33,14 +50,42 @@ impl Site {
         match self {
             Site::LinuxDo => "LinuxDo",
             Site::Juejin => "稀土掘金",
+            Site::V2ex => "V2EX",
+            Site::NodeSeek => "NodeSeek",
+            Site::SegmentFault => "思否",
         }
     }
 
-    fn other(self) -> Site {
+    fn home_url(self) -> &'static str {
         match self {
-            Site::LinuxDo => Site::Juejin,
-            Site::Juejin => Site::LinuxDo,
+            Site::LinuxDo => LINUXDO_URL,
+            Site::Juejin => JUEJIN_URL,
+            Site::V2ex => V2EX_URL,
+            Site::NodeSeek => NODESEEK_URL,
+            Site::SegmentFault => SEGMENTFAULT_URL,
         }
+    }
+
+    /// Key used in settings.json; matches the pre-multi-site values so old
+    /// settings files keep working.
+    fn persist_key(self) -> &'static str {
+        match self {
+            Site::LinuxDo => "linuxdo",
+            Site::Juejin => "juejin",
+            Site::V2ex => "v2ex",
+            Site::NodeSeek => "nodeseek",
+            Site::SegmentFault => "segmentfault",
+        }
+    }
+
+    fn from_persisted(key: &str) -> Option<Site> {
+        Site::all()
+            .into_iter()
+            .find(|site| site.persist_key() == key)
+    }
+
+    fn from_label(label: &str) -> Option<Site> {
+        Site::all().into_iter().find(|site| site.label() == label)
     }
 }
 
@@ -51,6 +96,9 @@ fn site_for_url(url: &Url) -> Option<Site> {
     match url.host_str()? {
         "linux.do" | "www.linux.do" => Some(Site::LinuxDo),
         "juejin.cn" | "www.juejin.cn" => Some(Site::Juejin),
+        "v2ex.com" | "www.v2ex.com" => Some(Site::V2ex),
+        "nodeseek.com" | "www.nodeseek.com" => Some(Site::NodeSeek),
+        "segmentfault.com" | "www.segmentfault.com" => Some(Site::SegmentFault),
         _ => None,
     }
 }
@@ -201,6 +249,9 @@ const TOOLBAR_SCRIPT: &str = r#"
           <option value="" disabled hidden>选择站点</option>
           <option value="https://linux.do/">LinuxDo</option>
           <option value="https://juejin.cn/">稀土掘金</option>
+          <option value="https://v2ex.com/">V2EX</option>
+          <option value="https://www.nodeseek.com/">NodeSeek</option>
+          <option value="https://segmentfault.com/">思否</option>
         </select>
       </div>
     `;
@@ -266,21 +317,16 @@ const TOOLBAR_SCRIPT: &str = r#"
 })();
 "#;
 
-fn build_site_window(
-    app: &AppHandle,
-    label: &str,
-    url: Url,
-    visible: bool,
-) -> tauri::Result<WebviewWindow> {
+fn build_site_window(app: &AppHandle, site: Site, url: Url) -> tauri::Result<WebviewWindow> {
     let navigation_app = app.clone();
-    let navigation_label = label.to_owned();
-    WebviewWindowBuilder::new(app, label, WebviewUrl::External(url))
-        .title("LinuxDo")
+    let navigation_label = site.label().to_owned();
+    WebviewWindowBuilder::new(app, site.label(), WebviewUrl::External(url))
+        .title(site.title())
         .inner_size(1280.0, 820.0)
         .min_inner_size(900.0, 600.0)
         .resizable(true)
         .accept_first_mouse(true)
-        .visible(visible)
+        .visible(false)
         .zoom_hotkeys_enabled(true)
         .initialization_script(TOOLBAR_SCRIPT)
         .on_page_load(move |window, payload| {
@@ -299,6 +345,7 @@ fn build_site_window(
             // active site; the hidden one stays hidden until a site switch.
             if active.label() == window.label() && !window.is_visible().unwrap_or(true) {
                 let _ = window.show();
+                let _ = window.set_focus();
             }
             // The toolbar host is recreated on each top-level navigation;
             // re-apply the remembered visibility.
@@ -326,8 +373,10 @@ fn build_site_window(
                 if let Err(error) = app.run_on_main_thread(move || {
                     if let Err(error) = reveal_site_window(&ui_app, target_site, deep_url) {
                         eprintln!("Could not switch site: {error}");
-                        for label in [LINUXDO_LABEL, JUEJIN_LABEL] {
-                            if let Some(window) = ui_app.get_webview_window(label) {
+                        // The failed target never took the screen; tell the
+                        // still-visible pages so their dropdown rolls back.
+                        for site in Site::all() {
+                            if let Some(window) = ui_app.get_webview_window(site.label()) {
                                 let _ = window.eval(
                                     "window.dispatchEvent(new Event('desktop-site-switch-failed')); \
                                      window.alert('站点切换失败，请重试。');",
@@ -360,41 +409,61 @@ fn build_site_window(
         .build()
 }
 
-/// Show `target`'s window and hide the other site's window. The incoming
-/// window inherits the outgoing one's on-screen geometry so the switch does
-/// not move anything; both webviews stay loaded, each keeping its scroll
-/// position, history and login state. A deep `url` (a specific post or
-/// topic) loads in the incoming window; a site-root switch keeps whatever
-/// page that window already shows.
+/// Show `target`'s window and hide every other site window. The window is
+/// created on first use (loading `url`, or the site's home page); after
+/// that it stays alive, keeping its scroll position, history and login
+/// state. The incoming window inherits the outgoing one's on-screen
+/// geometry so the switch does not move anything. A deep `url` (a specific
+/// post or topic) loads in the incoming window; a site-root switch keeps
+/// whatever page that window already shows.
 fn reveal_site_window(app: &AppHandle, target: Site, url: Option<Url>) -> tauri::Result<()> {
-    let incoming = app
-        .get_webview_window(target.label())
-        .ok_or_else(|| tauri::Error::WindowNotFound)?;
-    if let Some(url) = url {
-        incoming.navigate(url)?;
-    }
-    let outgoing = app.get_webview_window(target.other().label());
-    if let Some(outgoing) = &outgoing {
-        if outgoing.is_visible().unwrap_or(false) {
-            let scale = outgoing.scale_factor()?;
-            let size = outgoing.inner_size()?.to_logical::<f64>(scale);
-            let position = outgoing.outer_position()?.to_logical::<f64>(scale);
-            incoming.set_size(tauri::Size::Logical(LogicalSize::new(
-                size.width,
-                size.height,
-            )))?;
-            incoming.set_position(tauri::Position::Logical(LogicalPosition::new(
-                position.x, position.y,
-            )))?;
-            if outgoing.is_maximized().unwrap_or(false) {
-                let _ = incoming.maximize();
+    let incoming = match app.get_webview_window(target.label()) {
+        Some(window) => {
+            if let Some(url) = url {
+                window.navigate(url)?;
             }
+            window
+        }
+        None => build_site_window(
+            app,
+            target,
+            url.unwrap_or_else(|| target.home_url().parse().expect("valid site URL")),
+        )?,
+    };
+    if incoming.is_visible().unwrap_or(false) {
+        // Already the visible site (e.g. Cmd+1 while on LinuxDo); the deep
+        // link above was enough.
+        incoming.set_focus()?;
+        return Ok(());
+    }
+    let outgoing = Site::all()
+        .into_iter()
+        .filter(|site| *site != target)
+        .find_map(|site| app.get_webview_window(site.label()))
+        .filter(|window| window.is_visible().unwrap_or(false));
+    if let Some(outgoing) = &outgoing {
+        let scale = outgoing.scale_factor()?;
+        let size = outgoing.inner_size()?.to_logical::<f64>(scale);
+        let position = outgoing.outer_position()?.to_logical::<f64>(scale);
+        incoming.set_size(tauri::Size::Logical(LogicalSize::new(
+            size.width,
+            size.height,
+        )))?;
+        incoming.set_position(tauri::Position::Logical(LogicalPosition::new(
+            position.x, position.y,
+        )))?;
+        if outgoing.is_maximized().unwrap_or(false) {
+            let _ = incoming.maximize();
         }
     }
     incoming.show()?;
     incoming.set_focus()?;
-    if let Some(outgoing) = outgoing {
-        let _ = outgoing.hide();
+    for site in Site::all() {
+        if site != target {
+            if let Some(window) = app.get_webview_window(site.label()) {
+                let _ = window.hide();
+            }
+        }
     }
     if let Some(state) = app.try_state::<SharedState>() {
         state.lock().unwrap().active = target;
@@ -411,9 +480,9 @@ fn deep_navigation_url(url: &Url) -> Option<Url> {
 }
 
 /// Decide where a `window.open` / `target=_blank` request goes. Links to
-/// the two supported sites stay in the app — same-site links navigate the
-/// active window, cross-site links load in the other site's window — and
-/// everything else opens in the system browser.
+/// supported sites stay in the app — same-site links navigate the active
+/// window, cross-site links load in the other site's window — and everything
+/// else opens in the system browser.
 fn route_new_window(app: &AppHandle, url: Url) {
     let Some(target_site) = site_for_url(&url) else {
         // Ignore non-web schemes (about:blank, custom schemes) instead of
@@ -494,10 +563,11 @@ fn load_settings(app: &AppHandle) -> AppState {
         return defaults;
     };
     AppState {
-        active: match value.get("active").and_then(|v| v.as_str()) {
-            Some("juejin") => Site::Juejin,
-            _ => Site::LinuxDo,
-        },
+        active: value
+            .get("active")
+            .and_then(|v| v.as_str())
+            .and_then(Site::from_persisted)
+            .unwrap_or(Site::LinuxDo),
         show_toolbar: value
             .get("show_toolbar")
             .and_then(|v| v.as_bool())
@@ -510,10 +580,7 @@ fn save_settings(app: &AppHandle, state: &AppState) {
         return;
     };
     let text = serde_json::json!({
-        "active": match state.active {
-            Site::LinuxDo => "linuxdo",
-            Site::Juejin => "juejin",
-        },
+        "active": state.active.persist_key(),
         "show_toolbar": state.show_toolbar,
     })
     .to_string();
@@ -532,8 +599,8 @@ fn current_site_window(app: &AppHandle) -> Option<WebviewWindow> {
 /// Toggle the floating toolbar on every loaded site page by flipping the
 /// host element's display style from outside the closed shadow root.
 fn apply_toolbar_visibility(app: &AppHandle, visible: bool) {
-    for label in [LINUXDO_LABEL, JUEJIN_LABEL] {
-        let Some(window) = app.get_webview_window(label) else {
+    for site in Site::all() {
+        let Some(window) = app.get_webview_window(site.label()) else {
             continue;
         };
         let display = if visible { "''" } else { "'none'" };
@@ -619,6 +686,22 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<()> {
         .fullscreen()
         .build()?;
 
+    // One menu entry per site with Cmd+1..5 accelerators, mirroring the
+    // toolbar dropdown for keyboard switching.
+    let site_menu = SubmenuBuilder::new(app, "站点");
+    let mut site_menu = site_menu;
+    for (index, site) in Site::all().into_iter().enumerate() {
+        let item = MenuItem::with_id(
+            app,
+            format!("site-{}", site.persist_key()),
+            site.title(),
+            true,
+            Some(format!("CmdOrCtrl+{}", index + 1)),
+        )?;
+        site_menu = site_menu.item(&item);
+    }
+    let site_menu = site_menu.build()?;
+
     let window_menu = SubmenuBuilder::new(app, "窗口")
         .minimize()
         .separator()
@@ -629,6 +712,7 @@ fn build_app_menu(app: &AppHandle) -> tauri::Result<()> {
         .item(&app_menu)
         .item(&edit_menu)
         .item(&view_menu)
+        .item(&site_menu)
         .item(&window_menu)
         .build()?;
 
@@ -683,60 +767,17 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
             drop(state);
             apply_toolbar_visibility(app, visible);
         }
+        id if id.starts_with("site-") => {
+            let Some(site) = Site::from_persisted(id.trim_start_matches("site-")) else {
+                return;
+            };
+            // Menu-driven switching is a site-root reveal: keep that site's
+            // current page (or its home page on first open).
+            if let Err(error) = reveal_site_window(app, site, None) {
+                eprintln!("Could not switch site from menu: {error}");
+            }
+        }
         _ => {}
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recognizes_site_pages_without_intercepting_login_providers() {
-        for url in ["https://linux.do/", "https://linux.do/t/topic/123"] {
-            assert!(site_for_url(&url.parse().unwrap()) == Some(Site::LinuxDo));
-        }
-        for url in ["https://juejin.cn/", "https://juejin.cn/post/123"] {
-            assert!(site_for_url(&url.parse().unwrap()) == Some(Site::Juejin));
-        }
-        for url in [
-            "https://github.com/login/oauth/authorize",
-            "https://linux.do.example.com/",
-            "http://juejin.cn/",
-        ] {
-            assert!(site_for_url(&url.parse().unwrap()) == None);
-        }
-    }
-
-    #[test]
-    fn site_labels_and_titles_stay_paired() {
-        assert_eq!(Site::LinuxDo.label(), "main");
-        assert_eq!(Site::Juejin.label(), "juejin");
-        assert_eq!(Site::LinuxDo.other(), Site::Juejin);
-        assert_eq!(Site::Juejin.other(), Site::LinuxDo);
-    }
-
-    #[test]
-    fn site_roots_reveal_only_but_deep_links_navigate() {
-        for url in [
-            "https://juejin.cn/",
-            "https://linux.do/",
-            "https://linux.do/?page=2",
-        ] {
-            assert!(
-                deep_navigation_url(&url.parse().unwrap()).is_none(),
-                "site root should reveal without navigating: {url}"
-            );
-        }
-        for url in [
-            "https://juejin.cn/post/7360000000000000000",
-            "https://linux.do/t/topic/123/5",
-        ] {
-            assert!(
-                deep_navigation_url(&url.parse().unwrap()).is_some(),
-                "deep link should navigate the target window: {url}"
-            );
-        }
     }
 }
 
@@ -752,31 +793,14 @@ pub fn run() {
             // reads it to decide which site's window may show itself.
             app.manage(Mutex::new(settings));
 
-            // Both sites' windows exist from the start; only the remembered
-            // (or default) site is visible. Navigating cross-site reveals the
-            // other window without destroying either WebView.
-            let linuxdo = build_site_window(
+            // Lazy windows: only the remembered (or default) site's window
+            // exists at launch. Other sites are created on first switch and
+            // then kept alive for the whole session.
+            build_site_window(
                 app.handle(),
-                LINUXDO_LABEL,
-                LINUXDO_URL.parse().expect("valid LinuxDo URL"),
-                active == Site::LinuxDo,
+                active,
+                active.home_url().parse().expect("valid site URL"),
             )?;
-            linuxdo.set_title(Site::LinuxDo.title())?;
-            let juejin = build_site_window(
-                app.handle(),
-                JUEJIN_LABEL,
-                JUEJIN_URL.parse().expect("valid Juejin URL"),
-                active == Site::Juejin,
-            )?;
-            juejin.set_title(Site::Juejin.title())?;
-
-            let (visible, hidden) = if active == Site::LinuxDo {
-                (linuxdo, juejin)
-            } else {
-                (juejin, linuxdo)
-            };
-            visible.set_focus()?;
-            let _ = hidden.hide();
 
             build_app_menu(app.handle())?;
             if !show_toolbar {
@@ -795,13 +819,11 @@ pub fn run() {
             // Track which site window the user is interacting with so menu
             // commands act on the right page.
             let app = window.app_handle();
-            let Some(state) = app.try_state::<SharedState>() else {
+            let Some(site) = Site::from_label(window.label()) else {
                 return;
             };
-            let site = if window.label() == JUEJIN_LABEL {
-                Site::Juejin
-            } else {
-                Site::LinuxDo
+            let Some(state) = app.try_state::<SharedState>() else {
+                return;
             };
             let mut state = state.lock().unwrap();
             if state.active != site {
@@ -827,20 +849,104 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }
-        // Closing one site's window must not leave the app running with the
-        // other site hidden; quitting keeps "close window" == "quit app".
+        // Closing the last remaining site window quits the app: "close
+        // window" keeps meaning "quit app" even with lazy per-site windows.
         RunEvent::WindowEvent {
             event: WindowEvent::Destroyed,
             ..
         } => {
-            let remaining = [LINUXDO_LABEL, JUEJIN_LABEL]
-                .iter()
-                .filter_map(|label| app.get_webview_window(label))
+            let remaining = Site::all()
+                .into_iter()
+                .filter_map(|site| app.get_webview_window(site.label()))
                 .count();
-            if remaining == 1 {
+            if remaining == 0 {
                 app.exit(0);
             }
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_site_pages_without_intercepting_login_providers() {
+        for url in ["https://linux.do/", "https://linux.do/t/topic/123"] {
+            assert!(site_for_url(&url.parse().unwrap()) == Some(Site::LinuxDo));
+        }
+        for url in ["https://juejin.cn/", "https://juejin.cn/post/123"] {
+            assert!(site_for_url(&url.parse().unwrap()) == Some(Site::Juejin));
+        }
+        for url in [
+            "https://v2ex.com/",
+            "https://www.v2ex.com/t/1092000",
+            "https://www.nodeseek.com/",
+            "https://segmentfault.com/q/1010000000000000",
+        ] {
+            assert!(site_for_url(&url.parse().unwrap()).is_some());
+        }
+        for url in [
+            "https://github.com/login/oauth/authorize",
+            "https://linux.do.example.com/",
+            "http://juejin.cn/",
+            "https://v2ex.com.example.org/",
+        ] {
+            assert_eq!(site_for_url(&url.parse().unwrap()), None);
+        }
+    }
+
+    #[test]
+    fn site_labels_and_titles_stay_paired() {
+        assert_eq!(Site::LinuxDo.label(), "main");
+        assert_eq!(Site::Juejin.label(), "juejin");
+        assert_eq!(Site::V2ex.label(), "v2ex");
+        assert_eq!(Site::NodeSeek.label(), "nodeseek");
+        assert_eq!(Site::SegmentFault.label(), "segmentfault");
+        // Every label and persist key must be unique within Site::all().
+        let sites = Site::all();
+        for (i, a) in sites.iter().enumerate() {
+            for b in sites.iter().skip(i + 1) {
+                assert_ne!(a.label(), b.label(), "duplicate label");
+                assert_ne!(a.persist_key(), b.persist_key(), "duplicate persist key");
+            }
+        }
+        // Round-trip persistence keys, including the pre-multi-site values.
+        for site in sites {
+            assert_eq!(Site::from_persisted(site.persist_key()), Some(site));
+            assert_eq!(Site::from_label(site.label()), Some(site));
+        }
+        assert_eq!(Site::from_persisted("linuxdo"), Some(Site::LinuxDo));
+        assert_eq!(Site::from_persisted("juejin"), Some(Site::Juejin));
+        assert_eq!(Site::from_persisted("unknown"), None);
+    }
+
+    #[test]
+    fn site_roots_reveal_only_but_deep_links_navigate() {
+        for url in [
+            "https://juejin.cn/",
+            "https://linux.do/",
+            "https://linux.do/?page=2",
+            "https://www.nodeseek.com/",
+            "https://v2ex.com/",
+        ] {
+            assert!(
+                deep_navigation_url(&url.parse().unwrap()).is_none(),
+                "site root should reveal without navigating: {url}"
+            );
+        }
+        for url in [
+            "https://juejin.cn/post/7360000000000000000",
+            "https://linux.do/t/topic/123/5",
+            "https://v2ex.com/t/1092000",
+            "https://www.nodeseek.com/post-1280000-1",
+            "https://segmentfault.com/q/1010000000000000",
+        ] {
+            assert!(
+                deep_navigation_url(&url.parse().unwrap()).is_some(),
+                "deep link should navigate the target window: {url}"
+            );
+        }
+    }
 }
