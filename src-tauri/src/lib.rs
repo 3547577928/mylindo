@@ -16,7 +16,7 @@ const V2EX_URL: &str = "https://v2ex.com/";
 const NODESEEK_URL: &str = "https://www.nodeseek.com/";
 const SEGMENTFAULT_URL: &str = "https://segmentfault.com/";
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Site {
     LinuxDo,
     Juejin,
@@ -111,6 +111,9 @@ struct AppState {
     active: Site,
     /// Whether the floating toolbar is shown, remembered across restarts.
     show_toolbar: bool,
+    /// Last URL each site was left on, reported by the toolbar script;
+    /// remembered across restarts so a site reopens where reading stopped.
+    site_urls: std::collections::BTreeMap<Site, Url>,
 }
 
 type SharedState = Mutex<AppState>;
@@ -263,6 +266,17 @@ const TOOLBAR_SCRIPT: &str = r#"
     const site = shadow.getElementById('site');
     const address = shadow.getElementById('address');
     let selectedSite = '';
+    let reportedUrl = '';
+    const reportUrl = () => {
+      const href = window.location.href;
+      // Tell Rust where this site was left so the next launch can reopen
+      // the same page. Deduplicate: SPA apps fire this on every route change.
+      if (href === reportedUrl) return;
+      reportedUrl = href;
+      window.__TAURI_INTERNALS__?.invoke('plugin:app|report_site_url', {
+        url: href,
+      }).catch(() => {});
+    };
     const updateAddress = () => {
       address.value = window.location.href;
       address.title = window.location.href;
@@ -270,6 +284,7 @@ const TOOLBAR_SCRIPT: &str = r#"
         option.value && new URL(option.value).origin === window.location.origin
       )?.value ?? '';
       site.value = selectedSite;
+      reportUrl();
     };
     updateAddress();
     // SPA routes do not reload the document. Update on history changes rather
@@ -317,16 +332,58 @@ const TOOLBAR_SCRIPT: &str = r#"
 })();
 "#;
 
-fn build_site_window(app: &AppHandle, site: Site, url: Url) -> tauri::Result<WebviewWindow> {
+/// Geometry a new site window is born with, captured from another window.
+struct WindowOrigin {
+    size: LogicalSize<f64>,
+    position: LogicalPosition<f64>,
+    maximized: bool,
+}
+
+fn visible_window_origin(app: &AppHandle) -> Option<WindowOrigin> {
+    let outgoing = Site::all()
+        .into_iter()
+        .find_map(|site| app.get_webview_window(site.label()))
+        .filter(|window| window.is_visible().unwrap_or(false))?;
+    let scale = outgoing.scale_factor().ok()?;
+    let size = outgoing.inner_size().ok()?.to_logical::<f64>(scale);
+    let position = outgoing.outer_position().ok()?.to_logical::<f64>(scale);
+    Some(WindowOrigin {
+        size,
+        position,
+        maximized: outgoing.is_maximized().ok()?,
+    })
+}
+
+fn build_site_window(
+    app: &AppHandle,
+    site: Site,
+    url: Url,
+    origin: Option<WindowOrigin>,
+) -> tauri::Result<WebviewWindow> {
     let navigation_app = app.clone();
     let navigation_label = site.label().to_owned();
-    WebviewWindowBuilder::new(app, site.label(), WebviewUrl::External(url))
+    let mut builder = WebviewWindowBuilder::new(app, site.label(), WebviewUrl::External(url))
         .title(site.title())
         .inner_size(1280.0, 820.0)
         .min_inner_size(900.0, 600.0)
         .resizable(true)
         .accept_first_mouse(true)
-        .visible(false)
+        .visible(false);
+    // New windows inherit the visible window's geometry at construction:
+    // resizing a never-shown window is unreliable on macOS. First launch (no
+    // origin) centers instead.
+    match origin {
+        Some(origin) => {
+            builder = builder
+                .inner_size(origin.size.width, origin.size.height)
+                .position(origin.position.x, origin.position.y);
+            if origin.maximized {
+                builder = builder.maximized(true);
+            }
+        }
+        None => builder = builder.center(),
+    }
+    builder
         .zoom_hotkeys_enabled(true)
         .initialization_script(TOOLBAR_SCRIPT)
         .on_page_load(move |window, payload| {
@@ -410,54 +467,35 @@ fn build_site_window(app: &AppHandle, site: Site, url: Url) -> tauri::Result<Web
 }
 
 /// Show `target`'s window and hide every other site window. The window is
-/// created on first use (loading `url`, or the site's home page); after
-/// that it stays alive, keeping its scroll position, history and login
-/// state. The incoming window inherits the outgoing one's on-screen
-/// geometry so the switch does not move anything. A deep `url` (a specific
-/// post or topic) loads in the incoming window; a site-root switch keeps
-/// whatever page that window already shows.
+/// created on first use — loading `url`, else the page that site was last
+/// left on, else its home page — and then stays alive, keeping its scroll
+/// position, history and login state. New windows are born with the visible
+/// window's geometry so the switch does not move anything; a deep `url` (a
+/// specific post or topic) loads in the incoming window; a site-root switch
+/// keeps whatever page that window already shows.
 fn reveal_site_window(app: &AppHandle, target: Site, url: Option<Url>) -> tauri::Result<()> {
-    let incoming = match app.get_webview_window(target.label()) {
-        Some(window) => {
-            if let Some(url) = url {
-                window.navigate(url)?;
-            }
-            window
+    if let Some(incoming) = app.get_webview_window(target.label()) {
+        if let Some(url) = url {
+            incoming.navigate(url)?;
         }
-        None => build_site_window(
-            app,
-            target,
-            url.unwrap_or_else(|| target.home_url().parse().expect("valid site URL")),
-        )?,
-    };
-    if incoming.is_visible().unwrap_or(false) {
-        // Already the visible site (e.g. Cmd+1 while on LinuxDo); the deep
-        // link above was enough.
+        if incoming.is_visible().unwrap_or(false) {
+            // Already the visible site (e.g. Cmd+1 while on LinuxDo); the
+            // deep link above was enough.
+            incoming.set_focus()?;
+            return Ok(());
+        }
+        sync_visible_geometry(app, &incoming)?;
+        incoming.show()?;
         incoming.set_focus()?;
-        return Ok(());
+    } else {
+        let resume = url
+            .or_else(|| resume_url(app, target))
+            .unwrap_or_else(|| target.home_url().parse().expect("valid site URL"));
+        let origin = visible_window_origin(app);
+        let incoming = build_site_window(app, target, resume, origin)?;
+        incoming.show()?;
+        incoming.set_focus()?;
     }
-    let outgoing = Site::all()
-        .into_iter()
-        .filter(|site| *site != target)
-        .find_map(|site| app.get_webview_window(site.label()))
-        .filter(|window| window.is_visible().unwrap_or(false));
-    if let Some(outgoing) = &outgoing {
-        let scale = outgoing.scale_factor()?;
-        let size = outgoing.inner_size()?.to_logical::<f64>(scale);
-        let position = outgoing.outer_position()?.to_logical::<f64>(scale);
-        incoming.set_size(tauri::Size::Logical(LogicalSize::new(
-            size.width,
-            size.height,
-        )))?;
-        incoming.set_position(tauri::Position::Logical(LogicalPosition::new(
-            position.x, position.y,
-        )))?;
-        if outgoing.is_maximized().unwrap_or(false) {
-            let _ = incoming.maximize();
-        }
-    }
-    incoming.show()?;
-    incoming.set_focus()?;
     for site in Site::all() {
         if site != target {
             if let Some(window) = app.get_webview_window(site.label()) {
@@ -467,6 +505,21 @@ fn reveal_site_window(app: &AppHandle, target: Site, url: Option<Url>) -> tauri:
     }
     if let Some(state) = app.try_state::<SharedState>() {
         state.lock().unwrap().active = target;
+    }
+    Ok(())
+}
+
+/// Carry the visible window's geometry over to `incoming` before it is
+/// shown. `visible_window_origin` only picks currently visible windows, and
+/// `incoming` is not visible yet, so the origin is always the other window.
+fn sync_visible_geometry(app: &AppHandle, incoming: &WebviewWindow) -> tauri::Result<()> {
+    let Some(origin) = visible_window_origin(app) else {
+        return Ok(());
+    };
+    incoming.set_size(tauri::Size::Logical(origin.size))?;
+    incoming.set_position(tauri::Position::Logical(origin.position))?;
+    if origin.maximized {
+        let _ = incoming.maximize();
     }
     Ok(())
 }
@@ -540,7 +593,8 @@ fn open_in_browser(url: &Url) {
     });
 }
 
-/// Small JSON state file remembering the last site and toolbar visibility.
+/// Small JSON state file remembering the last site, per-site last URLs and
+/// toolbar visibility.
 fn settings_path(app: &AppHandle) -> Option<std::path::PathBuf> {
     app.path()
         .app_data_dir()
@@ -552,6 +606,7 @@ fn load_settings(app: &AppHandle) -> AppState {
     let defaults = AppState {
         active: Site::LinuxDo,
         show_toolbar: true,
+        site_urls: std::collections::BTreeMap::new(),
     };
     let Some(path) = settings_path(app) else {
         return defaults;
@@ -562,6 +617,20 @@ fn load_settings(app: &AppHandle) -> AppState {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
         return defaults;
     };
+    let site_urls = value
+        .get("site_urls")
+        .and_then(|v| v.as_object())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|(key, url)| {
+                    let site = Site::from_persisted(key)?;
+                    let url = url.as_str()?.parse().ok()?;
+                    Some((site, url))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     AppState {
         active: value
             .get("active")
@@ -572,6 +641,7 @@ fn load_settings(app: &AppHandle) -> AppState {
             .get("show_toolbar")
             .and_then(|v| v.as_bool())
             .unwrap_or(true),
+        site_urls,
     }
 }
 
@@ -579,15 +649,63 @@ fn save_settings(app: &AppHandle, state: &AppState) {
     let Some(path) = settings_path(app) else {
         return;
     };
+    let site_urls: serde_json::Map<String, serde_json::Value> = state
+        .site_urls
+        .iter()
+        .map(|(site, url)| {
+            (
+                site.persist_key().to_owned(),
+                serde_json::json!(url.as_str()),
+            )
+        })
+        .collect();
     let text = serde_json::json!({
         "active": state.active.persist_key(),
         "show_toolbar": state.show_toolbar,
+        "site_urls": site_urls,
     })
     .to_string();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(&path, text);
+}
+
+/// Where `site` was last left, if the toolbar script reported it and it is
+/// still a page of that site.
+fn resume_url(app: &AppHandle, site: Site) -> Option<Url> {
+    let state = app.try_state::<SharedState>()?;
+    let url = state.lock().unwrap().site_urls.get(&site).cloned()?;
+    if site_for_url(&url) == Some(site) {
+        Some(url)
+    } else {
+        None
+    }
+}
+
+/// Toolbar-script command: record the page a site is on so the next launch
+/// (or first lazy open) reopens on that page.
+#[tauri::command]
+fn report_site_url(app: AppHandle, url: String) -> Result<(), String> {
+    let Ok(url) = Url::parse(&url) else {
+        return Ok(());
+    };
+    let Some(site) = site_for_url(&url) else {
+        return Ok(());
+    };
+    let Some(state) = app.try_state::<SharedState>() else {
+        return Err("app state missing".into());
+    };
+    let mut state = state.lock().unwrap();
+    let unchanged = state
+        .site_urls
+        .get(&site)
+        .is_some_and(|current| current == &url);
+    if !unchanged {
+        state.site_urls.insert(site, url);
+        save_settings(&app, &state);
+    }
+    Ok(())
 }
 
 fn current_site_window(app: &AppHandle) -> Option<WebviewWindow> {
@@ -784,6 +902,7 @@ fn handle_menu_event(app: &AppHandle, id: &str) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![report_site_url])
         .setup(|app| {
             let settings = load_settings(app.handle());
             let show_toolbar = settings.show_toolbar;
@@ -794,13 +913,12 @@ pub fn run() {
             app.manage(Mutex::new(settings));
 
             // Lazy windows: only the remembered (or default) site's window
-            // exists at launch. Other sites are created on first switch and
-            // then kept alive for the whole session.
-            build_site_window(
-                app.handle(),
-                active,
-                active.home_url().parse().expect("valid site URL"),
-            )?;
+            // exists at launch, reopening the page that site was last left
+            // on. Other sites are created on first switch and then kept
+            // alive for the whole session.
+            let resume = resume_url(app.handle(), active)
+                .unwrap_or_else(|| active.home_url().parse().expect("valid site URL"));
+            build_site_window(app.handle(), active, resume, None)?;
 
             build_app_menu(app.handle())?;
             if !show_toolbar {

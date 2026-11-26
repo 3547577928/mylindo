@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-report-site-url"
+description = "Allows the toolbar script to report the current page URL of each site so the app can remember where reading stopped."
+commands.allow = ["report_site_url"]

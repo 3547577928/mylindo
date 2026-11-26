@@ -14,11 +14,13 @@ controls sit at the bottom right. Menu items **站点** also switch sites with
 
 Each site gets its own WebView, created on first visit and kept for the
 whole session. Switching sites reveals the other window and hides the
-current one (geometry is carried over), so each site keeps its scroll
-position, back/forward history and login state; cookies are shared through
-the persistent data store either way. The last active site and toolbar
-visibility are remembered across launches
-(`~/Library/Application Support/<identifier>/settings.json`).
+current one — new windows are born with the visible window's position and
+size, so nothing jumps — and each site keeps its scroll position,
+back/forward history and login state; cookies are shared through the
+persistent data store either way. The last active site, toolbar visibility
+and the page each site was last left on are remembered across launches
+(`~/Library/Application Support/<identifier>/settings.json`), so the app
+and every site reopen where reading stopped.
 
 Links that would open a new window (`target=_blank`, `window.open`) never
 spawn an app window: URLs on the five supported sites stay in the app (a

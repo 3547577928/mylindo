@@ -5,6 +5,7 @@
   "windows": ["main", "juejin", "v2ex", "nodeseek", "segmentfault"],
   "permissions": [
     "core:default",
-    "core:webview:allow-set-webview-zoom"
+    "core:webview:allow-set-webview-zoom",
+    "allow-report-site-url"
   ]
 }
